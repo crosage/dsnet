@@ -19,7 +19,7 @@ class InriaAerialDataset(CustomDataset):
 
     def __init__(self, **kwargs):
         super(InriaAerialDataset, self).__init__(
-            img_suffix='_sat.tif',
+            img_suffix='_sat.png',
             seg_map_suffix='_mask.png',
             reduce_zero_label=False,
             **kwargs)

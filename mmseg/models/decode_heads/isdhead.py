@@ -181,6 +181,74 @@ class RelationAwareFusion(nn.Module):
         out = self.smooth(s_feat + c_feat)
         return s_feat, c_feat, out
 
+class CrossAttentionFusionOptimized(nn.Module):
+    def __init__(self, channels, num_heads=8):
+        super(CrossAttentionFusionOptimized, self).__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+
+        assert self.head_dim * num_heads == self.channels, "channels must be divisible by num_heads"
+
+        self.query = nn.Conv2d(channels, channels, 1)
+        self.key = nn.Conv2d(channels, channels, 1)
+        self.value = nn.Conv2d(channels, channels, 1)
+        
+        self.out_conv = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, sp_feat, co_feat):
+        """
+        sp_feat: (B, C, H, W) - 高分辨率特征 (Query)
+        co_feat: (B, C, h, w) - 低分辨率特征 (Key, Value)
+        """
+        B, C, H, W = sp_feat.shape
+        _, _, h, w = co_feat.shape
+        
+        # --- 优化点: 将Query下采样到与Key/Value相同的分辨率 ---
+        sp_feat_downsampled = F.interpolate(sp_feat, size=(h, w), mode='bilinear', align_corners=False)
+        
+        # 1. 在低分辨率空间生成 Q, K, V
+        # Q 来自下采样后的 sp_feat，K, V 来自 co_feat
+        q = self.query(sp_feat_downsampled)
+        k = self.key(co_feat)
+        v = self.value(co_feat)
+
+        # 2. Reshape for Multi-head Attention
+        # (B, C, h, w) -> (B, num_heads, head_dim, h*w)
+        q = q.view(B, self.num_heads, self.head_dim, h * w).permute(0, 1, 3, 2) # (B, num_heads, h*w, head_dim)
+        k = k.view(B, self.num_heads, self.head_dim, h * w) # (B, num_heads, head_dim, h*w)
+        v = v.view(B, self.num_heads, self.head_dim, h * w).permute(0, 1, 3, 2) # (B, num_heads, h*w, head_dim)
+        
+        # 3. 计算注意力分数
+        # (B, num_heads, h*w, head_dim) @ (B, num_heads, head_dim, h*w) -> (B, num_heads, h*w, h*w)
+        attention_scores = torch.matmul(q, k) * (self.head_dim ** -0.5)
+        attention_weights = F.softmax(attention_scores, dim=-1)
+
+        # 4. 应用注意力权重到 V
+        # (B, num_heads, h*w, h*w) @ (B, num_heads, h*w, head_dim) -> (B, num_heads, h*w, head_dim)
+        attention_output = torch.matmul(attention_weights, v)
+        
+        # 5. Reshape and Upsample
+        # (B, h*w, C)
+        attention_output = attention_output.permute(0, 2, 1, 3).contiguous().view(B, h * w, C)
+        # (B, C, h, w)
+        attention_output = attention_output.permute(0, 2, 1).view(B, C, h, w)
+        
+        # --- 优化点: 将注意力结果上采样回原始高分辨率 ---
+        attention_output_upsampled = F.interpolate(attention_output, size=(H, W), mode='bilinear', align_corners=False)
+
+        # 6. 通过输出卷积并使用残差连接
+        out = sp_feat + self.gamma * self.out_conv(attention_output_upsampled)
+
+        # 保持与原模块相似的输出格式
+        return sp_feat, co_feat, out
+
 
 class Reducer(nn.Module):
     # Reduce channel (typically to 128)

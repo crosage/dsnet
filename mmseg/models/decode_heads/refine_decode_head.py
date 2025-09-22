@@ -213,6 +213,8 @@ class RefineBaseDecodeHead(BaseModule, metaclass=ABCMeta):
     @force_fp32(apply_to=('seg_logit', ))
     def losses(self, seg_logit, seg_label):
         """Compute segmentation loss."""
+        # ADD THIS LINE FOR DEBUGGING
+        # print(f'<<<<< DEBUG: The shape of seg_label is {seg_label.shape} >>>>>')
         loss = dict()
         seg_logit = resize(
             input=seg_logit,

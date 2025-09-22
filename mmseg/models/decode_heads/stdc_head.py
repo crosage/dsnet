@@ -139,7 +139,7 @@ class ShallowNet(nn.Module):
 
     def init_weight(self, pretrain_model):
 
-        state_dict = torch.load(pretrain_model)["state_dict"]
+        state_dict = torch.load(pretrain_model, map_location='cpu')["state_dict"]
         self_state_dict = self.state_dict()
         for k, v in state_dict.items():
             if k == 'features.0.conv.weight' and self.in_channels != 3:

@@ -1,6 +1,6 @@
 # dataset settings
 dataset_type = 'DeepGlobeDataset'
-data_root = '/home/qinjiaping/shaohua/dataset/deepglobe'
+data_root = '/data/DeepGlobe_land_cover_ISDNet'
 img_norm_cfg = dict(
     mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
 crop_size = (1224, 1224)
@@ -38,17 +38,17 @@ data = dict(
         type=dataset_type,
         data_root=data_root,
         img_dir='img_dir/train',
-        ann_dir='rgb2id/train',
+        ann_dir='ann_dir/train',
         pipeline=train_pipeline),
     val=dict(
         type=dataset_type,
         data_root=data_root,
         img_dir='img_dir/val',
-        ann_dir='rgb2id/val',
+        ann_dir='ann_dir/val',
         pipeline=test_pipeline),
     test=dict(
         type=dataset_type,
         data_root=data_root,
-        img_dir='img_dir/test',
-        ann_dir='rgb2id/test',
+        img_dir='img_dir/val',
+        ann_dir='ann_dir/val',
         pipeline=test_pipeline))

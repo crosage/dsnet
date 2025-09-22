@@ -4,7 +4,11 @@ _base_ = [
 ]
 norm_cfg = dict(type='SyncBN', requires_grad=True)
 model = dict(
-    pretrained='open-mmlab://resnet18_v1c',
+    pretrained=None,
+    init_cfg=dict(
+        type='Pretrained',
+        checkpoint='/home/zzn/.cache/torch/hub/checkpoints/resnet18_v1c-b5776b93.pth'
+    ),
     down_ratio=4,
     backbone=dict(depth=18),
     decode_head=[
