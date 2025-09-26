@@ -181,74 +181,88 @@ class RelationAwareFusion(nn.Module):
         out = self.smooth(s_feat + c_feat)
         return s_feat, c_feat, out
 
-class CrossAttentionFusionOptimized(nn.Module):
-    def __init__(self, channels, num_heads=8):
-        super(CrossAttentionFusionOptimized, self).__init__()
+class CrossAttentionFusionFinal(nn.Module):
+
+    def __init__(self, channels, in_channels_sp, in_channels_co, num_heads=8, reduction_ratio=2):
+        super(CrossAttentionFusionFinal, self).__init__()
+        
         self.channels = channels
+        
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
+        self.scale = self.head_dim ** -0.5
+        # 空间位置编码
+        self.pos_embed_sp = nn.Conv2d(channels, channels, 3, padding=1, groups=channels)
+        self.pos_embed_co = nn.Conv2d(channels, channels, 3, padding=1, groups=channels)
 
         assert self.head_dim * num_heads == self.channels, "channels must be divisible by num_heads"
 
-        self.query = nn.Conv2d(channels, channels, 1)
-        self.key = nn.Conv2d(channels, channels, 1)
-        self.value = nn.Conv2d(channels, channels, 1)
+        self.proj_sp = nn.Conv2d(in_channels_sp, channels, kernel_size=1)
+        self.proj_co = nn.Conv2d(in_channels_co, channels, kernel_size=1)
+
+        # Q的来源是高分辨率特征图 sp_feat
+        self.to_q = nn.Linear(channels, channels, bias=False)
+
+        # K和V的来源是低分辨率特征图 co_feat
+        self.to_k = nn.Linear(channels, channels, bias=False)
+        self.to_v = nn.Linear(channels, channels, bias=False)
+
+        # 对Key和Value进行序列缩减的模块
+        self.sr = nn.Conv2d(channels, channels, reduction_ratio, reduction_ratio)
+        self.norm = nn.LayerNorm(channels)
+
+        self.out_proj = nn.Linear(channels, channels)
         
-        self.out_conv = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True)
-        )
-        
+        # 残差连接的缩放因子
         self.gamma = nn.Parameter(torch.zeros(1))
 
     def forward(self, sp_feat, co_feat):
         """
-        sp_feat: (B, C, H, W) - 高分辨率特征 (Query)
-        co_feat: (B, C, h, w) - 低分辨率特征 (Key, Value)
+        sp_feat: 高分辨率特征 (B, in_channels_sp, H, W)
+        co_feat: 低分辨率特征 (B, in_channels_co, h, w)
         """
-        B, C, H, W = sp_feat.shape
-        _, _, h, w = co_feat.shape
-        
-        # --- 优化点: 将Query下采样到与Key/Value相同的分辨率 ---
-        sp_feat_downsampled = F.interpolate(sp_feat, size=(h, w), mode='bilinear', align_corners=False)
-        
-        # 1. 在低分辨率空间生成 Q, K, V
-        # Q 来自下采样后的 sp_feat，K, V 来自 co_feat
-        q = self.query(sp_feat_downsampled)
-        k = self.key(co_feat)
-        v = self.value(co_feat)
+        # print(f"************************channels{self.channels}")
+        # 0. 首先通过投影层将通道数统一为 self.channels
+        sp_feat_proj = self.proj_sp(sp_feat)
+        co_feat_proj = self.proj_co(co_feat)
+        sp_feat_proj = sp_feat_proj + self.pos_embed_sp(sp_feat_proj)
+        co_feat_proj = co_feat_proj + self.pos_embed_co(co_feat_proj)
 
-        # 2. Reshape for Multi-head Attention
-        # (B, C, h, w) -> (B, num_heads, head_dim, h*w)
-        q = q.view(B, self.num_heads, self.head_dim, h * w).permute(0, 1, 3, 2) # (B, num_heads, h*w, head_dim)
-        k = k.view(B, self.num_heads, self.head_dim, h * w) # (B, num_heads, head_dim, h*w)
-        v = v.view(B, self.num_heads, self.head_dim, h * w).permute(0, 1, 3, 2) # (B, num_heads, h*w, head_dim)
+        B, C, H, W = sp_feat_proj.shape
+        _, _, h, w = co_feat_proj.shape
         
-        # 3. 计算注意力分数
-        # (B, num_heads, h*w, head_dim) @ (B, num_heads, head_dim, h*w) -> (B, num_heads, h*w, h*w)
-        attention_scores = torch.matmul(q, k) * (self.head_dim ** -0.5)
-        attention_weights = F.softmax(attention_scores, dim=-1)
+        # 1. 生成Query，保持原始高分辨率
+        q_source = sp_feat_proj.flatten(2).transpose(1, 2)
+        q = self.to_q(q_source)
+        q = q.reshape(B, H * W, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
-        # 4. 应用注意力权重到 V
-        # (B, num_heads, h*w, h*w) @ (B, num_heads, h*w, head_dim) -> (B, num_heads, h*w, head_dim)
-        attention_output = torch.matmul(attention_weights, v)
+        # 2. 对低分辨率特征图进行序列缩减
+        co_feat_sr = self.sr(co_feat_proj)
+        co_feat_sr = co_feat_sr.flatten(2).transpose(1, 2)
+        co_feat_sr = self.norm(co_feat_sr)
+
+        # 3. 从降采样后的特征图中生成Key和Value
+        k = self.to_k(co_feat_sr)
+        v = self.to_v(co_feat_sr)
         
-        # 5. Reshape and Upsample
-        # (B, h*w, C)
-        attention_output = attention_output.permute(0, 2, 1, 3).contiguous().view(B, h * w, C)
-        # (B, C, h, w)
-        attention_output = attention_output.permute(0, 2, 1).view(B, C, h, w)
+        k = k.reshape(B, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = v.reshape(B, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        # 4. 计算注意力
+        attn_scores = (q @ k.transpose(-2, -1)) * self.scale
+        attn_weights = F.softmax(attn_scores, dim=-1)
+
+        # 5. 应用注意力权重到Value
+        attention_output = attn_weights @ v
         
-        # --- 优化点: 将注意力结果上采样回原始高分辨率 ---
-        attention_output_upsampled = F.interpolate(attention_output, size=(H, W), mode='bilinear', align_corners=False)
+        # 6. Reshape并投影回原始维度
+        attention_output = attention_output.permute(0, 2, 1, 3).reshape(B, H * W, C)
+        attention_output = self.out_proj(attention_output)
 
-        # 6. 通过输出卷积并使用残差连接
-        out = sp_feat + self.gamma * self.out_conv(attention_output_upsampled)
-
-        # 保持与原模块相似的输出格式
+        # 7. 应用残差连接 (注意：加到投影后的 sp_feat_proj 上)
+        out = sp_feat_proj + self.gamma * attention_output.transpose(1, 2).reshape(B, C, H, W)
+        
         return sp_feat, co_feat, out
-
 
 class Reducer(nn.Module):
     # Reduce channel (typically to 128)
@@ -274,8 +288,14 @@ class ISDHead(BaseCascadeDecodeHead):
     def __init__(self, down_ratio, prev_channels, reduce=False, **kwargs):
         super(ISDHead, self).__init__(**kwargs)
         self.down_ratio = down_ratio
-        self.fuse8 = RelationAwareFusion(self.channels, self.conv_cfg, self.norm_cfg, self.act_cfg, ext=2)
-        self.fuse16 = RelationAwareFusion(self.channels, self.conv_cfg, self.norm_cfg, self.act_cfg, ext=4)
+       
+        self.fuse8 = CrossAttentionFusionFinal(channels=self.channels, 
+                                       in_channels_sp=self.channels * 2, 
+                                       in_channels_co=self.channels)
+        self.fuse16 = CrossAttentionFusionFinal(channels=self.channels, 
+                                        in_channels_sp=self.channels * 4, 
+                                        in_channels_co=self.channels)
+
         self.sr_decoder = SRDecoder(self.conv_cfg, self.norm_cfg, self.act_cfg,
                                     channels=self.channels, up_lists=[4, 2, 2])
         # shallow branch
